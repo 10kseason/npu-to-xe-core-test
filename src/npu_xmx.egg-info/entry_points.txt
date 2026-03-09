@@ -1,0 +1,2 @@
+[console_scripts]
+npu-xmx = npu_xmx.cli:main

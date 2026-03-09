@@ -1,0 +1,2 @@
+numpy>=2.0
+openvino>=2025.4

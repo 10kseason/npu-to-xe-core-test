@@ -1,0 +1,74 @@
+Metadata-Version: 2.4
+Name: npu-xmx
+Version: 0.1.0
+Summary: Tensor-core-like FP16 matmul and linear blocks over Intel OpenVINO NPU, GPU, and CPU.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=2.0
+Requires-Dist: openvino>=2025.4
+
+# NPU XMX Prototype
+
+GPU Xe 텐서코어처럼 보이는 워크플로로 `MatMul`과 `Linear` 블록을 다루되, 실제 실행은 OpenVINO가 `NPU`, `GPU`, `CPU` 중 적절한 디바이스에 컴파일하도록 만든 작은 프로토타입입니다.
+
+핵심 아이디어는 단순합니다.
+
+- `FP16` 정밀도 위주로 고정
+- `pad_to=16` 기본값으로 타일 친화적인 shape 정렬
+- 반복 호출이 많은 경우에는 고정 weight `LinearBlock`을 미리 컴파일
+- NPU에서는 `NPU_TURBO`와 `THROUGHPUT/LATENCY` 힌트를 그대로 노출
+
+중요한 점도 하나 있습니다. 이 프로젝트는 GPU의 Xe XMX 명령을 직접 호출하는 방식이 아닙니다. 대신 OpenVINO의 NPU 백엔드가 잘 처리하는 `MatMul/Linear` 패턴을 텐서코어 스타일 인터페이스로 감싼 것입니다.
+
+## 빠른 시작
+
+```powershell
+python -m pip install -e .
+```
+
+디바이스 확인:
+
+```powershell
+npu-xmx devices
+```
+
+정적 `MatMul` 벤치마크:
+
+```powershell
+npu-xmx matmul --m 64 --k 1024 --n 1024 --devices NPU,GPU,CPU --iters 30
+```
+
+고정 weight `Linear` 블록 벤치마크:
+
+```powershell
+npu-xmx linear --batch 64 --in-features 1024 --out-features 2048 --devices NPU,GPU,CPU --iters 30
+```
+
+JSON 출력:
+
+```powershell
+npu-xmx matmul --json
+```
+
+## 코드 구조
+
+- `src/npu_xmx/engine.py`
+  - `OpenVINOTensorCore`: 디바이스 선택, shape 패딩, MatMul 캐시, Linear 컴파일
+  - `LinearBlock`: 반복 호출용 고정 weight 블록
+- `src/npu_xmx/cli.py`
+  - 장치 나열 및 `matmul/linear` 벤치마크 CLI
+- `tests/test_engine.py`
+  - CPU 경로 기준 수치 정확도 테스트
+
+## 왜 이런 식으로 만들었나
+
+OpenVINO NPU는 정적 shape와 컴파일된 그래프 기반 실행에 잘 맞습니다. 그래서 이 프로젝트는 텐서코어처럼 "연산 블록을 미리 준비해 반복 실행"하는 흐름에 맞춰 설계했습니다.
+
+1. 일반 `matmul(a, b)`는 shape별로 컴파일 결과를 캐시합니다.
+2. `compile_linear(weight, bias, batch_size=...)`는 weight를 상수로 박아서 반복 추론에 유리한 블록을 만듭니다.
+3. 결과 shape는 원본 크기로 잘라서 돌려주기 때문에 내부 패딩을 외부 API에서 신경 쓸 필요가 없습니다.
+
+## 참고 문서
+
+- [OpenVINO supported devices](https://docs.openvino.ai/2025/openvino-workflow/running-inference/inference-devices-and-modes.html)
+- [Intel NPU Acceleration Library](https://intel.github.io/intel-npu-acceleration-library/)

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npu-xmx"
+version = "0.1.0"
+description = "Tensor-core-like FP16 matmul and linear blocks over Intel OpenVINO NPU, GPU, and CPU."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "openvino>=2025.4",
+]
+
+[project.optional-dependencies]
+native-npu = [
+  "intel-npu-acceleration-library>=1.4.0",
+]
+
+[project.scripts]
+npu-xmx = "npu_xmx.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
