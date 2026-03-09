@@ -32,7 +32,7 @@ What is still missing is a repeatable net rendering win in a heavy real-world sc
   Local companion service with HTTP and low-overhead socket transports.
 - `src/npu_xmx/cli.py`
   Device listing, microbenchmarks, and bridge startup.
-- `fabric-npu-bridge-mod/`
+- `fabric-npu-bridge-mod - 복사본`
   Client-side Fabric mod that talks to the bridge, updates a dynamic texture, and records telemetry.
 - `tools/analyze_assist_log.py`
   Summarizes the latest NPU assist session from CSV logs.
