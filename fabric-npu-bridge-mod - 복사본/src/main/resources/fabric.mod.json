@@ -1,0 +1,28 @@
+{
+	"schemaVersion": 1,
+	"id": "npu_xmx_bridge",
+	"version": "${version}",
+	"name": "NPU XMX Bridge",
+	"description": "A Fabric client mod that sends sample tensor workloads to the local npu-xmx bridge.",
+	"authors": [
+		"Codex"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/npu_xmx_bridge/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.tensortest.npuxmxbridge.NpuXmxBridgeClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.18.2",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

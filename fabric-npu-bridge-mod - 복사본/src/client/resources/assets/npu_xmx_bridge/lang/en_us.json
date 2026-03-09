@@ -1,0 +1,4 @@
+{
+  "category.npu_xmx_bridge.general": "NPU XMX Bridge",
+  "key.npu_xmx_bridge.run_sample": "Toggle hybrid NPU shader assist"
+}
