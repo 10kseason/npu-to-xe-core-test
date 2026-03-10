@@ -1,14 +1,21 @@
 # Shaderpack Integration Notes
 
-This repository does **not** ship a third-party shaderpack, compiled GLSL output, or a bundled patch set for a specific pack.
+This repository does **not** ship a third-party shaderpack, compiled GLSL output, or a bundled patch set for a specific external pack.
 
 That is intentional.
 
 The recommended public-facing approach is:
 
 - keep the repository focused on the bridge, mod, telemetry, and integration contract
+- optionally ship a small original shaderpack that is authored in-repo
 - document how a shaderpack can consume the NPU assist texture
 - avoid redistributing third-party shader code unless licensing and packaging are handled explicitly
+
+This repository now includes one original in-repo pack:
+
+- `shaderpacks/intel-npu-shader/`
+
+That pack is safe to publish because it is repository-authored code, not a copied patch set from another shaderpack.
 
 ## Integration contract
 
@@ -79,6 +86,7 @@ Prefer publishing:
 - the bridge code
 - the Fabric mod
 - telemetry tools
+- original shaderpacks authored in this repository
 - integration notes
 - a small patch guide or a clean patch set if licensing allows it
 

@@ -29,19 +29,25 @@ What is still missing is a repeatable net rendering win in a heavy real-world sc
 - `src/npu_xmx/engine.py`
   Tensor-style `MatMul` / `Linear` execution over OpenVINO, with optional native Intel NPU acceleration for supported cases.
 - `src/npu_xmx/bridge.py`
-  Local companion service with HTTP and low-overhead socket transports.
+  Local companion service with HTTP and low-overhead socket transports. The hot `shader_run` socket path now uses a compact binary frame instead of JSON arrays.
 - `src/npu_xmx/cli.py`
   Device listing, microbenchmarks, and bridge startup.
-- `fabric-npu-bridge-mod - 복사본`
+- `fabric-npu-bridge-mod/`
   Client-side Fabric mod that talks to the bridge, updates a dynamic texture, and records telemetry.
 - `tools/analyze_assist_log.py`
   Summarizes the latest NPU assist session from CSV logs.
 - `docs/iris-npu-direction.md`
   Design notes and the current architectural direction.
+- `docs/shaderpack-integration.md`
+  Documents how to hook the NPU assist texture into an Iris shaderpack without publishing third-party shaderpack source here.
+- `shaderpacks/intel-npu-shader/`
+  Standalone original Iris shaderpack that consumes the live `npuAssist` texture from the Fabric mod.
 
 Important note:
 
-- The live Complementary/Euphoria shaderpack edits used during local profiling currently live in the author's local Minecraft profile, not as a packaged shader patch inside this repo yet.
+- This repository does not include a third-party shaderpack or compiled GLSL output.
+- It does include one original in-repo shaderpack: `shaderpacks/intel-npu-shader/`.
+- The local third-party shaderpack experiments used during profiling are still documented as an integration contract, not bundled as pack source.
 
 ## Tested stack
 
@@ -67,7 +73,7 @@ The project can:
 
 That part is real and works end to end.
 
-### 2. HTTP was too slow, socket transport was good enough
+### 2. HTTP was too slow, and the socket hot path had to drop JSON
 
 Early bridge numbers made this obvious:
 
@@ -76,6 +82,8 @@ Early bridge numbers made this obvious:
 - HTTP bridge: about `6.8 ms`
 
 HTTP was fine for inspection, but not for a hot path.
+
+The socket bridge originally still encoded `pixels_abgr` as a JSON integer array. That worked, but it left unnecessary parsing and boxing overhead on both Python and Java. The current `shader_run` path now keeps `compile/release` on JSON and sends the live frame itself as a binary payload.
 
 ### 3. Upload cost is not the main problem anymore
 
@@ -163,11 +171,12 @@ The practical route is still:
 
 ## Current shader direction
 
-The current experiment is moving away from post-FX replacement and toward budget shaping:
+The current experiment is moving away from cheap post-FX replacement and toward NPU-guided GI policy:
 
-- reflection budget
-- volumetric light budget
-- cloud budget
+- low-resolution indirect-light trajectory fields
+- shadowed receiver GI energy fields
+- water reflection policy
+- shadow and volumetric softness shaping
 
 The helper that consumes the NPU assist now also mixes in GPU-visible scene context such as:
 
@@ -234,11 +243,28 @@ At a high level it:
 
 Useful JVM properties include:
 
-- `-Dnpuxmxbridge.intervalMs=150`
-- `-Dnpuxmxbridge.updateEveryNFrames=4`
-- `-Dnpuxmxbridge.maxAssistAgeFrames=10`
+- `-Dnpuxmxbridge.intervalMs=75`
+- `-Dnpuxmxbridge.updateEveryNFrames=1`
+- `-Dnpuxmxbridge.maxAssistAgeFrames=4`
 - `-Dnpuxmxbridge.minPositionDelta=0.75`
 - `-Dnpuxmxbridge.minAngleDelta=3.0`
+- `-Dnpuxmxbridge.shaderProfile=intel_npu_gi_v2`
+
+## Intel NPU Shader
+
+The repository now includes a standalone original Iris shaderpack in [`shaderpacks/intel-npu-shader/`](shaderpacks/intel-npu-shader/README.md).
+
+This pack is not a patch of another pack. It is a clean fullscreen `final` pass that:
+
+- samples the live `npuAssist` texture from the Fabric mod
+- uses the NPU field as indirect-light / reflection policy input
+- relies on the bridge's `intel_npu_gi_v2` profile by default
+
+Recommended JVM properties for this pack:
+
+- `-Dnpuxmxbridge.shaderProfile=intel_npu_gi_v2`
+- `-Dnpuxmxbridge.shaderTileSize=96`
+- `-Dnpuxmxbridge.shaderPreviewScale=0`
 
 ## Telemetry
 
@@ -283,6 +309,10 @@ The intended integration path is:
 
 Before making the repository public, follow [`docs/github-publish-checklist.md`](docs/github-publish-checklist.md).
 
+For shaderpack-side integration guidance, see [`docs/shaderpack-integration.md`](docs/shaderpack-integration.md).
+
+For the standalone original pack included here, see [`shaderpacks/intel-npu-shader/README.md`](shaderpacks/intel-npu-shader/README.md).
+
 ## Honest project assessment
 
 Right now the best description is:
@@ -298,7 +328,7 @@ So this repository should be read as a serious working prototype and research lo
 
 - keep narrowing focus toward reflection and volumetric budgets
 - keep cloud control only if it shows measurable benefit
-- package the local shaderpack edits into a reproducible distributable patch
+- keep evolving the in-repo original shaderpack around richer NPU-native profiles
 - continue ABAB telemetry runs in heavy water / reflection / volumetric scenes
 
 ## References
