@@ -9,14 +9,14 @@ into a small original rendering pipeline with:
 - HDR-style lighting accumulation in `composite`
 - sun-directed shadow mapping through a real `shadow` pass
 - ACES-like tone mapping in `final`
-- NPU-driven color / glow / softness shaping on top
+- NPU-guided GI estimation and light-trajectory tracing on top
 
 ## What it does
 
 - writes terrain, textured geometry, entities, and hand passes into a small G-buffer
 - shades the scene with sun-direction lighting and shadow map visibility
 - tone-maps the HDR result back to display space
-- uses the low-resolution NPU field as a live flow / tint / mask texture
+- uses the low-resolution NPU field as a live GI / water-reflection policy texture
 
 ## Requirements
 
@@ -28,15 +28,18 @@ into a small original rendering pipeline with:
 ## Recommended JVM properties
 
 ```text
--Dnpuxmxbridge.shaderProfile=intel_npu_native_v2
+-Dnpuxmxbridge.shaderProfile=intel_npu_gi_v2
 -Dnpuxmxbridge.shaderTileSize=96
 -Dnpuxmxbridge.shaderPreviewScale=0
+-Dnpuxmxbridge.intervalMs=75
 ```
 
-The `intel_npu_native_v2` profile routes a wider, deeper dense field through the
-bridge's native-biased linear pipeline when Intel NPU native support is available.
-Compared with `v1`, it uses more input features and one more linear stage so the
-NPU contributes more strongly to shadow, water, and grading policy.
+The `intel_npu_gi_v2` profile routes the shader field through a lighter hybrid
+NPU pipeline: native-biased linear blocks build a scene policy basis, then
+explicit NPU `matmul` stages decode that basis into indirect-light direction and
+GI energy coefficients. The GPU still performs full-resolution HDR fetches and
+shadow/depth work, but the NPU now owns more of the low-frequency GI policy while
+staying closer to a 16.6 ms 60 FPS-style budget at `96x96`.
 
 ## How to move more work to the NPU
 
@@ -45,9 +48,10 @@ Use the NPU for low-frequency control fields, not for the whole frame.
 Good candidates:
 
 - shadow softness or shadow budget maps
-- exposure, glare, and palette coefficients
+- exposure, glare, indirect-light thresholds, and palette coefficients
 - fog, horizon glow, and day/night grading controls
 - reflection or volumetric sample budgets
+- low-resolution indirect-light trajectory / reflection path fields
 
 Keep on the GPU:
 

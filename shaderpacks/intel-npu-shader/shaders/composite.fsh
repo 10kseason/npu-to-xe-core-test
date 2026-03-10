@@ -123,13 +123,14 @@ void main() {
     float ndl = saturate1(dot(worldNormal, worldLightDir));
     // This is a good NPU hand-off seam: the NPU can predict "how soft should the sun shadow be
     // in this region?" while the actual PCF compare still happens here on the GPU.
-    float pcfRadius = mix(0.75, 2.25, assist.a);
+    float pcfRadius = mix(0.85, 2.80, assist.a);
     float shadowVisibility = sampleShadowMap(shadowCoord, pcfRadius);
-    float screenShadow = sampleScreenSunShadow(uv, depth, shadowLightPosition.xy, mix(8.0, 28.0, assist.a));
-    float shadowDensity = mix(0.58, 1.0, assist.r);
-    float shadowStrength = mix(0.45, 0.90, sunHeight) * shadowDensity;
-    float shadowTerm = min(shadowVisibility, screenShadow);
-    float sunShadow = mix(1.0, shadowTerm, shadowStrength * ndl);
+    float screenShadow = sampleScreenSunShadow(uv, depth, shadowLightPosition.xy, mix(10.0, 34.0, assist.a));
+    float shadowDensity = mix(0.82, 1.18, assist.r);
+    float shadowContrast = mix(1.65, 1.25, sunHeight);
+    float shadowTerm = pow(saturate1(min(shadowVisibility, screenShadow)), shadowContrast);
+    float shadowStrength = saturate1(mix(0.78, 1.00, sunHeight) * shadowDensity * (0.42 + ndl * 0.58));
+    float sunShadow = mix(1.0, shadowTerm, shadowStrength);
 
     float blockLight = bakedLight.r;
     float skyLight = bakedLight.g;
@@ -141,13 +142,22 @@ void main() {
     float assistEnergy = assist.b;
     // Another NPU-friendly seam: ambient color scales, sun warmth, and horizon energy are cheap
     // control fields. The actual shadow lookup, depth reconstruction, and view-dependent fresnel are not.
-    vec3 hdr = albedo * ambientColor * ambientAmount;
+    float shadowAmbient = mix(0.62, 1.0, sunShadow);
+    vec3 hdr = albedo * ambientColor * ambientAmount * shadowAmbient;
     hdr += albedo * sunColor * ndl * sunShadow * (0.55 + skyLight * 1.35);
     hdr += albedo * (0.10 + assistEnergy * 0.22) * horizonGlow;
     hdr += albedo * blockLight * blockLight * (1.25 + assist.a * 0.35);
 
-    float fresnel = pow(1.0 - saturate1(dot(worldNormal, normalize(mat3(gbufferModelViewInverse) * normalize(-viewPos)))), 3.0);
+    vec3 viewDirWorld = normalize(mat3(gbufferModelViewInverse) * normalize(-viewPos));
+    float fresnel = pow(1.0 - saturate1(dot(worldNormal, viewDirWorld)), 3.0);
     hdr += sunColor * fresnel * ndl * sunShadow * (0.04 + assistEnergy * 0.08);
+
+    // Feed the final GI stage with a stronger indirect-light seed in darker regions.
+    // The NPU predicts low-frequency GI direction/energy, while the GPU keeps the
+    // live normal/view/depth work and builds the local shadowed color basis here.
+    float shadowLift = (1.0 - sunShadow);
+    vec3 shadowBounceSeed = albedo * mix(ambientColor, sunColor, 0.18) * shadowLift * (0.12 + assistEnergy * 0.24 + assist.a * 0.14);
+    hdr += shadowBounceSeed;
 
     /* RENDERTARGETS: 0 */
     gl_FragData[0] = vec4(max(hdr, vec3(0.0)), 1.0);
