@@ -1,0 +1,65 @@
+{
+  "targets": {
+    "swap": {}
+  },
+  "passes": [
+    {
+      "vertex_shader": "minecraft:core/screenquad",
+      "fragment_shader": "npu_xmx_bridge:post/npu_assist",
+      "inputs": [
+        {
+          "sampler_name": "In",
+          "target": "minecraft:main",
+          "bilinear": true
+        },
+        {
+          "sampler_name": "NpuAssist",
+          "location": "npu_xmx_bridge:shader_preview",
+          "width": 192,
+          "height": 192,
+          "bilinear": true
+        }
+      ],
+      "output": "swap",
+      "uniforms": {
+        "AssistConfig": [
+          {
+            "name": "WarpAmount",
+            "type": "float",
+            "value": 0.018
+          },
+          {
+            "name": "TintMix",
+            "type": "float",
+            "value": 0.55
+          },
+          {
+            "name": "TintLift",
+            "type": "float",
+            "value": 0.34
+          }
+        ]
+      }
+    },
+    {
+      "vertex_shader": "minecraft:core/screenquad",
+      "fragment_shader": "minecraft:post/blit",
+      "inputs": [
+        {
+          "sampler_name": "In",
+          "target": "swap"
+        }
+      ],
+      "uniforms": {
+        "BlitConfig": [
+          {
+            "name": "ColorModulate",
+            "type": "vec4",
+            "value": [1.0, 1.0, 1.0, 1.0]
+          }
+        ]
+      },
+      "output": "minecraft:main"
+    }
+  ]
+}

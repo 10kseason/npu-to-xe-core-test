@@ -11,9 +11,10 @@ The recommended public-facing approach is:
 - document how a shaderpack can consume the NPU assist texture
 - avoid redistributing third-party shader code unless licensing and packaging are handled explicitly
 
-This repository now includes one original in-repo pack:
+This repository now includes original in-repo packs:
 
 - `shaderpacks/intel-npu-shader/`
+- `shaderpacks/intel-npu-shader2/`
 
 That pack is safe to publish because it is repository-authored code, not a copied patch set from another shaderpack.
 
@@ -24,6 +25,10 @@ The Fabric mod exposes a dynamic texture with this logical role:
 - low-resolution NPU-generated assist field
 - updated at low frequency
 - consumed by the shaderpack as a policy / budget source
+
+The texture contract does not change across transports. Whether the mod gets the field from the socket bridge, `translator/procedural`, `translator/replay`, or `translator/python-stdio`, the shaderpack still reads the same logical `npuAssist` texture.
+
+That also means end users can receive a prebuilt mod jar plus one original shaderpack folder without cloning the repo. The transport choice changes how the field is produced, not how the shaderpack binds or samples it.
 
 In the local experiment, that texture is registered as:
 
@@ -57,6 +62,7 @@ Wrap it in a helper that:
 - interprets the low-resolution assist field
 - converts it into budgets such as reflection, volumetric, and cloud budgets
 - optionally mixes in scene-local GPU context like depth, smoothness, or sky visibility
+- optionally performs a small spatial filter so single-tile changes do not punch obvious blocks into the frame
 
 ### 4. Apply it only to expensive passes
 
@@ -66,8 +72,22 @@ Use the helper in places that can actually save meaningful work:
 - water reflection refinement count
 - volumetric light step count
 - cloud step count
+- GI tap count or GI direction bias, if the shader already has a stable rejection path for bad samples
 
 Avoid using it mainly for decorative post-FX replacement. That path was useful for demos, but not for reliable frame-time wins.
+
+## Dynamic-object stability guidance
+
+If the assist is low-frequency, dynamic entities and silhouettes are where artifacts show up first. The current in-repo packs handle that by combining three rules:
+
+1. Reserve a lightweight mask for dynamic geometry when possible.
+   - In the in-repo packs, an entity/hand bit is written into a spare G-buffer channel and read back in later fullscreen passes.
+2. Reject policy-driven GI/reflection gathers across depth and normal discontinuities.
+   - If a low-resolution trajectory points across a hard edge, treat it as untrusted and fall back toward a safer GPU-local direction.
+3. Reduce assist strength near silhouettes.
+   - Fade assist-driven GI energy, exposure, bounce, or reflection gain where the entity mask or discontinuity score is high.
+
+If you skip these guards, low-resolution assist fields tend to create double-image ghosting around mobs, held items, leaf edges, and thin geometry.
 
 ## What not to publish in this repo
 

@@ -2,11 +2,13 @@
 
 ## Current status
 
-- The end-to-end path works: Java -> bridge -> NPU -> dynamic texture -> Iris shaderpack.
-- Recent telemetry shows the bridge is no longer the main problem.
+- The end-to-end path works with both transports:
+  - Java -> socket bridge -> Python/OpenVINO -> dynamic texture -> Iris shaderpack
+  - Java -> in-process translator -> `python-stdio` worker -> dynamic texture -> Iris shaderpack
+- Recent telemetry shows the TCP bridge is no longer the only viable path.
 - Update cadence is low enough to reuse results across frames.
 - Upload cost is negligible compared with total frame time.
-- The remaining issue is shader target selection, not transport.
+- The remaining issue is shader target selection and temporal stability on dynamic silhouettes, not raw transport wiring.
 - The current runtime reports OpenGL 3.3, so a new compute-shader merge stage is not a safe default on this machine.
 
 ## What the Iris pipeline implies
@@ -34,14 +36,14 @@
 
 1. Keep NPU output low-resolution and low-frequency.
 2. Treat NPU output as policy, not as final shading.
-3. Consume that policy in Iris compute/deferred/composite stages.
-4. Store the merged policy in a persistent custom image or SSBO.
-5. Let heavy GPU passes read the persistent policy to reduce sample count, refinement count, blur radius, or step budget.
+3. Consume that policy in Iris deferred/composite/final stages first, and only use compute/image-store merge paths on hardware that exposes the right GL feature set.
+4. Store the merged policy in a persistent custom image or SSBO only on the higher-feature path.
+5. Let heavy GPU passes read the policy to reduce sample count, refinement count, blur radius, or step budget.
 
 ## Immediate implementation direction
 
 1. Stop trying to replace cheap post-FX math.
-2. Focus on reflection, volumetric light, and cloud step budgets.
+2. Focus on reflection, volumetric light, fog, and GI budgets.
 3. On hardware that exposes the needed GL feature set, add a compute or image-store merge pass that:
    - reads the NPU assist texture,
    - blends it with GPU-visible masks already available in the shaderpack,
@@ -49,8 +51,9 @@
 4. On the current OpenGL 3.3 path, keep the same budget logic in shader helper code first:
    - sample raw NPU assist,
    - combine it with depth, smoothness, and sky visibility in-place,
+   - suppress or weaken the assist near entity pixels and silhouette discontinuities,
    - use that merged result inside reflection, volumetric, and cloud budget helpers.
-5. Make reflection and volumetric passes consume the merged budget source first.
+5. Make reflection, volumetric, and GI-heavy passes consume the merged budget source first.
 6. Keep cloud control only if it shows measurable gain after the above change.
 
 ## Why not direct GPU -> NPU -> GPU
@@ -66,3 +69,29 @@
 - Stable benefit in fixed-scene ABAB runs.
 - No visible shader compile instability.
 - Benefit remains after warm-up and result reuse are enabled.
+- Dynamic objects do not show obvious double-image ghosting after entity masking and depth/normal discontinuity rejection are applied.
+
+## Current practical recommendation
+
+- Use `npuxmxbridge.transport=translator` for local testing unless you explicitly need the socket bridge.
+- Use `npuxmxbridge.translatorBackend=procedural` or `replay` for bridge-free smoke tests.
+- Use `npuxmxbridge.translatorBackend=python-stdio` for the live NPU/OpenVINO path without TCP sockets.
+- For distributed `jar + shaderpack` setups, omit `pythonWorkingDir` and let the mod extract the bundled worker from the mod jar automatically.
+- Prefer `intel-npu-shader2` with `intel_npu_shader2_v1` when testing "more NPU-directed" policy behavior.
+- If moving mobs or held items smear, shorten assist reuse before changing the model:
+  - `-Dnpuxmxbridge.intervalMs=50`
+  - `-Dnpuxmxbridge.maxAssistAgeFrames=2`
+  - `-Dnpuxmxbridge.shaderTileSize=64`
+
+## Distribution note
+
+The practical public shape is now:
+
+- one built mod jar from `fabric-npu-bridge-mod/build/libs/`
+- one original in-repo shaderpack
+- launcher JVM args that use `translator/python-stdio`
+- no repo checkout path and normally no `pythonWorkingDir`
+
+That matters because the transport contract is now stable enough to document as an end-user flow, not only as a developer workflow. The shaderpack still reads the same logical `npuAssist` texture either way.
+
+For installation and packaging details, see [`standalone-jar-setup.md`](standalone-jar-setup.md).
