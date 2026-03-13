@@ -14,17 +14,16 @@ vec3 toLinear(vec3 color) {
 
 void main() {
     vec4 albedo = texture2D(gtexture, texCoord) * tintColor;
-    if (albedo.a < 0.02) {
+    if (albedo.a < 0.1) {
         discard;
     }
 
     vec2 bakedLight = texture2D(lightmap, lightmapCoord).rg;
     vec3 encodedNormal = normalize(worldNormal) * 0.5 + 0.5;
-    vec3 baseColor = toLinear(albedo.rgb);
 
     /* RENDERTARGETS: 0,1,2,4 */
-    gl_FragData[0] = vec4(baseColor, albedo.a);
+    gl_FragData[0] = vec4(toLinear(albedo.rgb), 1.0);
     gl_FragData[1] = vec4(encodedNormal, 1.0);
-    gl_FragData[2] = vec4(clamp(bakedLight, 0.0, 1.0), 0.0, 1.0);
-    gl_FragData[3] = vec4(0.5, 0.5, 0.0, 0.0);
+    gl_FragData[2] = vec4(clamp(bakedLight, 0.0, 1.0), 1.0, 1.0);
+    gl_FragData[3] = vec4(0.5, 0.5, 0.0, 1.0);
 }

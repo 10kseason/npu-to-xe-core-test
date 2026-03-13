@@ -25,6 +25,6 @@ void main() {
     /* RENDERTARGETS: 0,1,2,4 */
     gl_FragData[0] = vec4(baseColor, albedo.a);
     gl_FragData[1] = vec4(encodedNormal, 1.0);
-    gl_FragData[2] = vec4(clamp(bakedLight, 0.0, 1.0), 0.0, 1.0);
+    gl_FragData[2] = vec4(clamp(bakedLight, 0.0, 1.0), 1.0, 1.0);
     gl_FragData[3] = vec4(0.5, 0.5, 0.0, 0.0);
 }

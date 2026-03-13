@@ -57,6 +57,19 @@ int budgetTapCount(float budget, int minTaps, int maxTaps) {
     return int(floor(mix(float(minTaps), float(maxTaps) + 0.999, clampedBudget)));
 }
 
+float sampleDepthDiscontinuity(vec2 uv, float centerDepth) {
+    vec2 pixel = vec2(1.0 / max(viewWidth, 1.0), 1.0 / max(viewHeight, 1.0));
+    float maxGap = 0.0;
+    maxGap = max(maxGap, abs(centerDepth - texture2D(depthtex0, saturate2(uv + vec2(pixel.x, 0.0))).r));
+    maxGap = max(maxGap, abs(centerDepth - texture2D(depthtex0, saturate2(uv - vec2(pixel.x, 0.0))).r));
+    maxGap = max(maxGap, abs(centerDepth - texture2D(depthtex0, saturate2(uv + vec2(0.0, pixel.y))).r));
+    maxGap = max(maxGap, abs(centerDepth - texture2D(depthtex0, saturate2(uv - vec2(0.0, pixel.y))).r));
+    float farFactor = smoothstep(0.60, 0.985, centerDepth);
+    float minThreshold = mix(0.0012, 0.00018, farFactor);
+    float maxThreshold = mix(0.022, 0.0048, farFactor);
+    return smoothstep(minThreshold, maxThreshold, maxGap);
+}
+
 float sampleShadowMap(vec3 shadowCoord, float texelRadius, int kernelRadius) {
     if (shadowCoord.x <= 0.0 || shadowCoord.x >= 1.0 || shadowCoord.y <= 0.0 || shadowCoord.y >= 1.0) {
         return 1.0;
@@ -115,10 +128,16 @@ void main() {
     }
 
     vec3 worldNormal = decodeNormal(texture2D(colortex1, uv).rgb);
-    vec2 bakedLight = texture2D(colortex2, uv).rg;
-    // composite consumes the merged low-frequency NPU lighting policy and keeps
-    // the current-frame shadow/depth work on the GPU.
+    vec4 lightData = texture2D(colortex2, uv);
+    vec2 bakedLight = lightData.rg;
+    float entityMask = lightData.b;
+    // shader2 trusts the low-resolution NPU policy more directly and keeps only
+    // the live depth and shadow comparisons on the GPU.
     NpuPolicy policy = mergeScreenNpuPolicy(npuAssist, uv, depth, luma(albedo), bakedLight);
+    float farFieldSuppression = smoothstep(0.72, 0.985, depth);
+    float depthDiscontinuity = sampleDepthDiscontinuity(uv, depth);
+    float assistFade = saturate1(entityMask * 0.75 + farFieldSuppression * 0.48 + depthDiscontinuity * 0.36);
+    float effectiveBudget = mix(policy.budget, min(policy.budget, 0.30), assistFade);
 
     // Reconstructing positions from the live frame must stay on the GPU.
     // It uses current matrices and depth values that the NPU does not see directly.
@@ -140,21 +159,24 @@ void main() {
     float ndl = saturate1(dot(worldNormal, worldLightDir));
     // This is a good NPU hand-off seam: the NPU can predict "how soft should the sun shadow be
     // in this region?" while the actual PCF compare still happens here on the GPU.
-    float pcfRadius = mix(0.80, 3.60, policy.budget);
-    int shadowKernelRadius = policy.budget >= 0.58 ? 1 : 0;
-    int screenShadowSamples = budgetTapCount(policy.budget, 2, 6);
+    float pcfRadius = mix(0.92, 3.00, effectiveBudget);
+    int shadowKernelRadius = effectiveBudget >= 0.64 ? 1 : 0;
+    int screenShadowSamples = budgetTapCount(effectiveBudget, 1, 3);
     float shadowVisibility = sampleShadowMap(shadowCoord, pcfRadius, shadowKernelRadius);
-    float screenShadow = sampleScreenSunShadow(
+    float screenShadowRaw = sampleScreenSunShadow(
         uv,
         depth,
         shadowLightPosition.xy,
-        mix(12.0, 48.0, policy.budget),
+        mix(5.0, 14.0, effectiveBudget) * mix(1.0, 0.26, farFieldSuppression),
         screenShadowSamples
     );
-    float shadowDensity = mix(0.78, 1.24, policy.budget * 0.68 + policy.energy * 0.32);
+    float screenShadow = mix(1.0, screenShadowRaw, 1.0 - assistFade * 0.82);
+    float assistEnergy = mix(policy.energy, min(policy.energy, 0.38), entityMask);
+    assistEnergy = mix(assistEnergy, min(assistEnergy, 0.22), farFieldSuppression * 0.65 + depthDiscontinuity * 0.30);
+    float shadowDensity = mix(0.86, 1.12, effectiveBudget * 0.50 + assistEnergy * 0.24);
     float shadowContrast = mix(1.65, 1.25, sunHeight);
     float shadowTerm = pow(saturate1(min(shadowVisibility, screenShadow)), shadowContrast);
-    float shadowStrength = saturate1(mix(0.78, 1.00, sunHeight) * shadowDensity * (0.42 + ndl * 0.58));
+    float shadowStrength = saturate1(mix(0.80, 1.00, sunHeight) * shadowDensity * (0.42 + ndl * 0.58));
     float sunShadow = mix(1.0, shadowTerm, shadowStrength);
 
     float blockLight = bakedLight.r;
@@ -164,24 +186,23 @@ void main() {
     vec3 sunColor = mix(vec3(1.25, 0.72, 0.48), vec3(1.35, 1.24, 1.14), sunHeight);
 
     float horizonGlow = pow(max(0.0, 1.0 - sunHeight), 1.75);
-    float assistEnergy = policy.energy;
     // Another NPU-friendly seam: ambient color scales, sun warmth, and horizon energy are cheap
     // control fields. The actual shadow lookup, depth reconstruction, and view-dependent fresnel are not.
     float shadowAmbient = mix(0.62, 1.0, sunShadow);
     vec3 hdr = albedo * ambientColor * ambientAmount * shadowAmbient;
     hdr += albedo * sunColor * ndl * sunShadow * (0.55 + skyLight * 1.35);
-    hdr += albedo * (0.05 + assistEnergy * 0.32 + policy.budget * 0.10) * horizonGlow;
-    hdr += albedo * blockLight * blockLight * (1.02 + policy.budget * 0.72 + assistEnergy * 0.10);
+    hdr += albedo * (0.05 + assistEnergy * 0.22 + effectiveBudget * 0.08) * horizonGlow * (1.0 - assistFade * 0.60);
+    hdr += albedo * blockLight * blockLight * (1.00 + effectiveBudget * 0.54 + assistEnergy * 0.08) * (1.0 - assistFade * 0.36);
 
     vec3 viewDirWorld = normalize(mat3(gbufferModelViewInverse) * normalize(-viewPos));
     float fresnel = pow(1.0 - saturate1(dot(worldNormal, viewDirWorld)), 3.0);
-    hdr += sunColor * fresnel * ndl * sunShadow * (0.04 + assistEnergy * 0.08);
+    hdr += sunColor * fresnel * ndl * sunShadow * (0.03 + assistEnergy * 0.05) * (1.0 - assistFade * 0.44);
 
     // Feed the final GI stage with a stronger indirect-light seed in darker regions.
     // The NPU predicts low-frequency GI direction/energy, while the GPU keeps the
     // live normal/view/depth work and builds the local shadowed color basis here.
     float shadowLift = (1.0 - sunShadow);
-    vec3 shadowBounceSeed = albedo * mix(ambientColor, sunColor, 0.18) * shadowLift * (0.06 + assistEnergy * 0.36 + policy.budget * 0.28);
+    vec3 shadowBounceSeed = albedo * mix(ambientColor, sunColor, 0.18) * shadowLift * (0.05 + assistEnergy * 0.20 + effectiveBudget * 0.16) * (1.0 - assistFade * 0.74);
     hdr += shadowBounceSeed;
 
     /* RENDERTARGETS: 0 */

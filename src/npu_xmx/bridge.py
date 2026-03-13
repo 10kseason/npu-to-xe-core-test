@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from time import perf_counter
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -69,6 +70,50 @@ class _RenderedShaderFrame:
     mean_luma: float
     profile: str
     backend: str
+
+
+@dataclass(frozen=True)
+class _ScenePolicyHints:
+    sun_height: float = 0.5
+    rain_strength: float = 0.0
+    thunder_strength: float = 0.0
+    block_light: float = 0.0
+    sky_light: float = 1.0
+    submerged_factor: float = 0.0
+    quality_budget: float = 1.0
+    optimization_pressure: float = 0.0
+
+
+@dataclass(frozen=True)
+class ShaderProfileBenchmarkResult:
+    device: str
+    profile: str
+    backend: str
+    width: int
+    height: int
+    average_ms: float
+    min_ms: float
+    max_ms: float
+    p95_ms: float
+    iterations: int
+    updates_per_second: float
+    pixels_per_second: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "device": self.device,
+            "profile": self.profile,
+            "backend": self.backend,
+            "width": self.width,
+            "height": self.height,
+            "average_ms": self.average_ms,
+            "min_ms": self.min_ms,
+            "max_ms": self.max_ms,
+            "p95_ms": self.p95_ms,
+            "iterations": self.iterations,
+            "updates_per_second": self.updates_per_second,
+            "pixels_per_second": self.pixels_per_second,
+        }
 
 
 class BridgeState:
@@ -174,7 +219,7 @@ class BridgeState:
         device = str(payload.get("device", "AUTO"))
         hint = str(payload.get("hint", "THROUGHPUT"))
         turbo = bool(payload.get("turbo", True))
-        profile = str(payload.get("profile", "intel_npu_gi_v2"))
+        profile = str(payload.get("profile", "intel_npu_gi_v3"))
         resolved_device = self.engine.resolve_device(device)
         batch_size = width * height
 
@@ -236,6 +281,7 @@ class BridgeState:
         yaw_degrees = float(payload.get("yaw_degrees", 0.0))
         pitch_degrees = float(payload.get("pitch_degrees", 0.0))
         time_seconds = float(payload.get("time_seconds", 0.0))
+        scene_hints = _scene_policy_hints_from_payload(payload)
 
         shader_inputs = _build_shader_inputs(
             width=session.width,
@@ -246,9 +292,21 @@ class BridgeState:
             yaw_degrees=yaw_degrees,
             pitch_degrees=pitch_degrees,
             time_seconds=time_seconds,
+            sun_height=scene_hints.sun_height,
+            rain_strength=scene_hints.rain_strength,
+            thunder_strength=scene_hints.thunder_strength,
+            block_light=scene_hints.block_light,
+            sky_light=scene_hints.sky_light,
+            submerged_factor=scene_hints.submerged_factor,
+            quality_budget=scene_hints.quality_budget,
+            optimization_pressure=scene_hints.optimization_pressure,
             input_features=session.block.input_features,
         )
-        output = session.block(shader_inputs)
+        output = _apply_realtime_budget_policy(
+            session.block(shader_inputs),
+            scene_hints,
+            profile=session.profile,
+        )
         pixels_abgr, mean_alpha, mean_luma = _pack_shader_pixels_array(output)
         return _RenderedShaderFrame(
             session_id=session_id,
@@ -388,6 +446,22 @@ def _native_shader_weight_matrix_gi_v2() -> dict[str, np.ndarray]:
     }
 
 
+def _native_shader_weight_matrix_gi_v3() -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(181)
+    return {
+        "w1": (rng.standard_normal((80, 128), dtype=np.float32) * 0.15).astype(np.float16),
+        "b1": (rng.standard_normal((128,), dtype=np.float32) * 0.020).astype(np.float16),
+        "w2": (rng.standard_normal((128, 80), dtype=np.float32) * 0.12).astype(np.float16),
+        "b2": (rng.standard_normal((80,), dtype=np.float32) * 0.017).astype(np.float16),
+        "w3": (rng.standard_normal((80, 48), dtype=np.float32) * 0.10).astype(np.float16),
+        "b3": (rng.standard_normal((48,), dtype=np.float32) * 0.015).astype(np.float16),
+        "m1": (rng.standard_normal((48, 64), dtype=np.float32) * 0.10).astype(np.float16),
+        "m2": (rng.standard_normal((64, 32), dtype=np.float32) * 0.090).astype(np.float16),
+        "m3": (rng.standard_normal((32, 4), dtype=np.float32) * 0.080).astype(np.float16),
+        "b4": np.asarray([0.02, -0.01, 0.22, 0.02], dtype=np.float16),
+    }
+
+
 def _compile_shader_field_block(
     *,
     engine: OpenVINOTensorCore,
@@ -447,6 +521,22 @@ def _compile_shader_field_block(
         )
     if profile == "intel_npu_gi_v2":
         return _compile_native_shader_field_block_gi_v2(
+            engine=engine,
+            batch_size=batch_size,
+            device=device,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+    if profile == "intel_npu_gi_v3":
+        return _compile_native_shader_field_block_gi_v3(
+            engine=engine,
+            batch_size=batch_size,
+            device=device,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+    if profile == "intel_npu_shader2_v1":
+        return _compile_native_shader_field_block_shader2_v1(
             engine=engine,
             batch_size=batch_size,
             device=device,
@@ -1047,6 +1137,234 @@ def _compile_native_shader_field_block_gi_v2(
     )
 
 
+def _compile_native_shader_field_block_gi_v3(
+    *,
+    engine: OpenVINOTensorCore,
+    batch_size: int,
+    device: str,
+    performance_hint: str,
+    turbo: bool,
+) -> _ShaderFieldBlock:
+    # GI v3 is intentionally Xe-core-biased: a wider basis plus aligned matmul-heavy
+    # decode keeps more of the low-frequency reflection / fog / shadow policy field
+    # inside NPU-friendly GEMM work before the GPU applies frame-local depth and
+    # texture sampling.
+    weights = _native_shader_weight_matrix_gi_v3()
+    layer1 = engine.compile_linear(
+        _augment_bias_weight(weights["w1"], weights["b1"]),
+        batch_size=batch_size,
+        device=device,
+        dtype=np.float16,
+        pad_to=16,
+        performance_hint=performance_hint,
+        turbo=turbo,
+    )
+    layer2 = engine.compile_linear(
+        _augment_bias_weight(weights["w2"], weights["b2"]),
+        batch_size=batch_size,
+        device=device,
+        dtype=np.float16,
+        pad_to=16,
+        performance_hint=performance_hint,
+        turbo=turbo,
+    )
+    layer3 = engine.compile_linear(
+        _augment_bias_weight(weights["w3"], weights["b3"]),
+        batch_size=batch_size,
+        device=device,
+        dtype=np.float16,
+        pad_to=16,
+        performance_hint=performance_hint,
+        turbo=turbo,
+    )
+
+    matmul_backend = (
+        "native_matmul"
+        if engine._use_native_npu_backend(device, np.dtype(np.float16))
+        else "openvino_matmul"
+    )
+
+    def runner(shader_inputs: np.ndarray) -> np.ndarray:
+        hidden1 = layer1(_append_bias_feature(shader_inputs))
+        np.maximum(hidden1, 0.0, out=hidden1)
+        hidden2 = layer2(_append_bias_feature(hidden1))
+        np.maximum(hidden2, 0.0, out=hidden2)
+        hidden3 = layer3(_append_bias_feature(hidden2))
+        hidden3_f32 = np.asarray(hidden3, dtype=np.float32)
+        np.tanh(hidden3_f32, out=hidden3_f32)
+
+        lane_state = engine.matmul(
+            hidden3_f32.astype(np.float16),
+            weights["m1"],
+            device=device,
+            dtype=np.float16,
+            pad_to=16,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+        lane_state_f32 = np.asarray(lane_state, dtype=np.float32)
+        np.tanh(lane_state_f32, out=lane_state_f32)
+
+        policy_state = engine.matmul(
+            lane_state_f32.astype(np.float16),
+            weights["m2"],
+            device=device,
+            dtype=np.float16,
+            pad_to=16,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+        policy_state_f32 = np.asarray(policy_state, dtype=np.float32)
+        np.tanh(policy_state_f32, out=policy_state_f32)
+
+        output = engine.matmul(
+            policy_state_f32.astype(np.float16),
+            weights["m3"],
+            device=device,
+            dtype=np.float16,
+            pad_to=16,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+        output_f32 = np.asarray(output, dtype=np.float32)
+        output_f32 += np.asarray(weights["b4"], dtype=np.float32)
+        np.clip(output_f32, -8.0, 8.0, out=output_f32)
+        output_f32 = 1.0 / (1.0 + np.exp(-output_f32))
+        return output_f32.astype(np.float16)
+
+    block_backends = {layer1.backend, layer2.backend, layer3.backend}
+    if block_backends == {"intel_npu_acceleration_library"} and matmul_backend == "native_matmul":
+        backend = "native_gi_xe_matmul_pipeline_v3"
+    elif block_backends == {"openvino"} and matmul_backend == "openvino_matmul":
+        backend = "openvino_gi_xe_matmul_pipeline_v3"
+    else:
+        backend = "hybrid_gi_xe_matmul_pipeline_v3"
+
+    return _ShaderFieldBlock(
+        runner=runner,
+        device=device,
+        input_features=80,
+        output_features=4,
+        max_batch=batch_size,
+        dtype=np.dtype(np.float16),
+        profile="intel_npu_gi_v3",
+        backend=backend,
+    )
+
+
+def _compile_native_shader_field_block_shader2_v1(
+    *,
+    engine: OpenVINOTensorCore,
+    batch_size: int,
+    device: str,
+    performance_hint: str,
+    turbo: bool,
+) -> _ShaderFieldBlock:
+    # shader2 v1 reuses the GI v3 topology and weights, but surfaces a distinct
+    # profile name so the runtime can preserve more NPU-authored policy under load.
+    weights = _native_shader_weight_matrix_gi_v3()
+    layer1 = engine.compile_linear(
+        _augment_bias_weight(weights["w1"], weights["b1"]),
+        batch_size=batch_size,
+        device=device,
+        dtype=np.float16,
+        pad_to=16,
+        performance_hint=performance_hint,
+        turbo=turbo,
+    )
+    layer2 = engine.compile_linear(
+        _augment_bias_weight(weights["w2"], weights["b2"]),
+        batch_size=batch_size,
+        device=device,
+        dtype=np.float16,
+        pad_to=16,
+        performance_hint=performance_hint,
+        turbo=turbo,
+    )
+    layer3 = engine.compile_linear(
+        _augment_bias_weight(weights["w3"], weights["b3"]),
+        batch_size=batch_size,
+        device=device,
+        dtype=np.float16,
+        pad_to=16,
+        performance_hint=performance_hint,
+        turbo=turbo,
+    )
+
+    matmul_backend = (
+        "native_matmul"
+        if engine._use_native_npu_backend(device, np.dtype(np.float16))
+        else "openvino_matmul"
+    )
+
+    def runner(shader_inputs: np.ndarray) -> np.ndarray:
+        hidden1 = layer1(_append_bias_feature(shader_inputs))
+        np.maximum(hidden1, 0.0, out=hidden1)
+        hidden2 = layer2(_append_bias_feature(hidden1))
+        np.maximum(hidden2, 0.0, out=hidden2)
+        hidden3 = layer3(_append_bias_feature(hidden2))
+        hidden3_f32 = np.asarray(hidden3, dtype=np.float32)
+        np.tanh(hidden3_f32, out=hidden3_f32)
+
+        lane_state = engine.matmul(
+            hidden3_f32.astype(np.float16),
+            weights["m1"],
+            device=device,
+            dtype=np.float16,
+            pad_to=16,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+        lane_state_f32 = np.asarray(lane_state, dtype=np.float32)
+        np.tanh(lane_state_f32, out=lane_state_f32)
+
+        policy_state = engine.matmul(
+            lane_state_f32.astype(np.float16),
+            weights["m2"],
+            device=device,
+            dtype=np.float16,
+            pad_to=16,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+        policy_state_f32 = np.asarray(policy_state, dtype=np.float32)
+        np.tanh(policy_state_f32, out=policy_state_f32)
+
+        output = engine.matmul(
+            policy_state_f32.astype(np.float16),
+            weights["m3"],
+            device=device,
+            dtype=np.float16,
+            pad_to=16,
+            performance_hint=performance_hint,
+            turbo=turbo,
+        )
+        output_f32 = np.asarray(output, dtype=np.float32)
+        output_f32 += np.asarray(weights["b4"], dtype=np.float32)
+        np.clip(output_f32, -8.0, 8.0, out=output_f32)
+        output_f32 = 1.0 / (1.0 + np.exp(-output_f32))
+        return output_f32.astype(np.float16)
+
+    block_backends = {layer1.backend, layer2.backend, layer3.backend}
+    if block_backends == {"intel_npu_acceleration_library"} and matmul_backend == "native_matmul":
+        backend = "native_shader2_matmul_pipeline_v1"
+    elif block_backends == {"openvino"} and matmul_backend == "openvino_matmul":
+        backend = "openvino_shader2_matmul_pipeline_v1"
+    else:
+        backend = "hybrid_shader2_matmul_pipeline_v1"
+
+    return _ShaderFieldBlock(
+        runner=runner,
+        device=device,
+        input_features=80,
+        output_features=4,
+        max_batch=batch_size,
+        dtype=np.dtype(np.float16),
+        profile="intel_npu_shader2_v1",
+        backend=backend,
+    )
+
+
 def _build_shader_inputs(
     *,
     width: int,
@@ -1057,6 +1375,14 @@ def _build_shader_inputs(
     yaw_degrees: float,
     pitch_degrees: float,
     time_seconds: float,
+    sun_height: float = 0.5,
+    rain_strength: float = 0.0,
+    thunder_strength: float = 0.0,
+    block_light: float = 0.0,
+    sky_light: float = 1.0,
+    submerged_factor: float = 0.0,
+    quality_budget: float = 1.0,
+    optimization_pressure: float = 0.0,
     input_features: int,
 ) -> np.ndarray:
     xs = np.linspace(-1.0, 1.0, width, dtype=np.float32)
@@ -1092,6 +1418,56 @@ def _build_shader_inputs(
     pitch_u = pitch_feature * grid_x
     radius_wave = np.sin(radius2 * np.pi * 1.5 + time_seconds * 0.31)
     horizon_wave = horizon * np.cos(time_seconds * 0.11 + grid_x * np.pi)
+    sun_height_feature = np.full_like(grid_x, np.clip(sun_height * 2.0 - 1.0, -1.0, 1.0))
+    rain_strength_feature = np.full_like(grid_x, np.clip(rain_strength * 2.0 - 1.0, -1.0, 1.0))
+    thunder_strength_feature = np.full_like(grid_x, np.clip(thunder_strength * 2.0 - 1.0, -1.0, 1.0))
+    block_light_feature = np.full_like(grid_x, np.clip(block_light * 2.0 - 1.0, -1.0, 1.0))
+    sky_light_feature = np.full_like(grid_x, np.clip(sky_light * 2.0 - 1.0, -1.0, 1.0))
+    submerged_feature = np.full_like(grid_x, np.clip(submerged_factor * 2.0 - 1.0, -1.0, 1.0))
+    quality_budget_feature = np.full_like(grid_x, np.clip(quality_budget * 2.0 - 1.0, -1.0, 1.0))
+    optimization_pressure_feature = np.full_like(
+        grid_x, np.clip(optimization_pressure * 2.0 - 1.0, -1.0, 1.0)
+    )
+    sun_horizon = sun_height_feature * horizon
+    rain_horizon = rain_strength_feature * horizon
+    thunder_horizon = thunder_strength_feature * horizon
+    sky_horizon = sky_light_feature * horizon
+    block_radius = block_light_feature * radius2
+    submerged_radius = submerged_feature * radius2
+    sun_grid_y = sun_height_feature * grid_y
+    rain_edge = rain_strength_feature * edge_mask
+    thunder_diag = thunder_strength_feature * diag
+    sky_anti_diag = sky_light_feature * anti_diag
+    micro_lane_u = np.sin(grid_x * np.pi * 4.0)
+    micro_lane_v = np.cos(grid_y * np.pi * 4.0)
+    micro_lane_cross = micro_lane_u * micro_lane_v
+    micro_lane_diag = np.sin((grid_x + grid_y) * np.pi * 2.0)
+    sun_time_wave = sun_height_feature * time_feature
+    sky_time_wave = sky_light_feature * time_feature
+    storm_time_wave = thunder_strength_feature * time_feature
+    rain_radius = rain_strength_feature * radius_wave
+    thunder_radius = thunder_strength_feature * radius_wave
+    block_horizon = block_light_feature * horizon
+    sky_edge = sky_light_feature * edge_mask
+    submerged_horizon = submerged_feature * horizon
+    sun_lane = sun_height_feature * micro_lane_u
+    storm_lane = thunder_strength_feature * micro_lane_cross
+    light_cross = block_light_feature * uv
+    submerged_time = submerged_feature * time_feature
+    quality_horizon = quality_budget_feature * horizon
+    pressure_horizon = optimization_pressure_feature * horizon
+    quality_radius = quality_budget_feature * radius2
+    pressure_edge = optimization_pressure_feature * edge_mask
+    quality_time = quality_budget_feature * time_feature
+    pressure_time = optimization_pressure_feature * time_feature
+    quality_light = quality_budget_feature * sky_light_feature
+    pressure_light = optimization_pressure_feature * block_light_feature
+    quality_rain = quality_budget_feature * rain_strength_feature
+    pressure_rain = optimization_pressure_feature * rain_strength_feature
+    quality_submerged = quality_budget_feature * submerged_feature
+    pressure_submerged = optimization_pressure_feature * submerged_feature
+    quality_lane = quality_budget_feature * micro_lane_cross
+    pressure_diag = optimization_pressure_feature * diag
 
     features = np.stack(
         [
@@ -1127,10 +1503,95 @@ def _build_shader_inputs(
             pitch_u,
             radius_wave,
             horizon_wave,
+            sun_height_feature,
+            rain_strength_feature,
+            thunder_strength_feature,
+            block_light_feature,
+            sky_light_feature,
+            submerged_feature,
+            sun_horizon,
+            rain_horizon,
+            thunder_horizon,
+            sky_horizon,
+            block_radius,
+            submerged_radius,
+            sun_grid_y,
+            rain_edge,
+            thunder_diag,
+            sky_anti_diag,
+            micro_lane_u,
+            micro_lane_v,
+            micro_lane_cross,
+            micro_lane_diag,
+            sun_time_wave,
+            sky_time_wave,
+            storm_time_wave,
+            rain_radius,
+            thunder_radius,
+            block_horizon,
+            sky_edge,
+            submerged_horizon,
+            sun_lane,
+            storm_lane,
+            light_cross,
+            submerged_time,
+            quality_budget_feature,
+            optimization_pressure_feature,
+            quality_horizon,
+            pressure_horizon,
+            quality_radius,
+            pressure_edge,
+            quality_time,
+            pressure_time,
+            quality_light,
+            pressure_light,
+            quality_rain,
+            pressure_rain,
+            quality_submerged,
+            pressure_submerged,
+            quality_lane,
+            pressure_diag,
         ],
         axis=-1,
     )
     return features.reshape(width * height, features.shape[-1])[:, :input_features].astype(np.float16)
+
+
+def _apply_realtime_budget_policy(
+    output: np.ndarray,
+    scene_hints: _ScenePolicyHints,
+    *,
+    profile: str = "intel_npu_gi_v3",
+) -> np.ndarray:
+    quality_budget = float(np.clip(scene_hints.quality_budget, 0.0, 1.0))
+    optimization_pressure = float(np.clip(scene_hints.optimization_pressure, 0.0, 1.0))
+    if quality_budget >= 0.999 and optimization_pressure <= 0.001:
+        return np.asarray(output, dtype=np.float16)
+
+    rgba = np.asarray(output, dtype=np.float32).copy()
+    if profile == "intel_npu_shader2_v1":
+        trajectory_scale = max(
+            (0.84 + quality_budget * 0.16) * (1.0 - optimization_pressure * 0.05),
+            0.82,
+        )
+        energy_scale = max(
+            (0.80 + quality_budget * 0.20) * (1.0 - optimization_pressure * 0.08),
+            0.74,
+        )
+        budget_scale = max(
+            quality_budget * (1.0 - optimization_pressure * 0.14),
+            quality_budget * 0.72,
+        )
+    else:
+        trajectory_scale = (0.76 + quality_budget * 0.24) * (1.0 - optimization_pressure * 0.08)
+        energy_scale = (0.72 + quality_budget * 0.28) * (1.0 - optimization_pressure * 0.12)
+        budget_scale = quality_budget * (1.0 - optimization_pressure * 0.22)
+
+    rgba[:, 0:2] = 0.5 + (rgba[:, 0:2] - 0.5) * trajectory_scale
+    rgba[:, 2] *= energy_scale
+    rgba[:, 3] *= budget_scale
+    np.clip(rgba, 0.0, 1.0, out=rgba)
+    return rgba.astype(np.float16)
 
 
 def _augment_bias_weight(weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
@@ -1173,6 +1634,115 @@ def _pack_shader_pixels(output: np.ndarray) -> tuple[list[int], float, float]:
     return signed.tolist(), mean_alpha, mean_luma
 
 
+def benchmark_shader_profile(
+    *,
+    profile: str,
+    width: int,
+    height: int,
+    devices: tuple[str, ...] = ("NPU", "GPU", "CPU"),
+    iterations: int = 20,
+    warmup: int = 3,
+    performance_hint: str = "THROUGHPUT",
+    turbo: bool = True,
+    pos_x: float = 12.0,
+    pos_y: float = 80.0,
+    pos_z: float = -6.0,
+    yaw_degrees: float = 45.0,
+    pitch_degrees: float = 10.0,
+    time_seconds: float = 1.25,
+    sun_height: float = 0.5,
+    rain_strength: float = 0.0,
+    thunder_strength: float = 0.0,
+    block_light: float = 0.0,
+    sky_light: float = 1.0,
+    submerged_factor: float = 0.0,
+    quality_budget: float = 1.0,
+    optimization_pressure: float = 0.0,
+) -> list[ShaderProfileBenchmarkResult]:
+    engine = OpenVINOTensorCore()
+    batch_size = width * height
+    results: list[ShaderProfileBenchmarkResult] = []
+    scene_hints = _ScenePolicyHints(
+        sun_height=sun_height,
+        rain_strength=rain_strength,
+        thunder_strength=thunder_strength,
+        block_light=block_light,
+        sky_light=sky_light,
+        submerged_factor=submerged_factor,
+        quality_budget=quality_budget,
+        optimization_pressure=optimization_pressure,
+    )
+
+    for device_name in devices:
+        resolved_device = engine.resolve_device(device_name)
+        block = _compile_shader_field_block(
+            engine=engine,
+            batch_size=batch_size,
+            device=resolved_device,
+            performance_hint=performance_hint,
+            turbo=turbo,
+            profile=profile,
+        )
+        shader_inputs = _build_shader_inputs(
+            width=width,
+            height=height,
+            pos_x=pos_x,
+            pos_y=pos_y,
+            pos_z=pos_z,
+            yaw_degrees=yaw_degrees,
+            pitch_degrees=pitch_degrees,
+            time_seconds=time_seconds,
+            sun_height=sun_height,
+            rain_strength=rain_strength,
+            thunder_strength=thunder_strength,
+            block_light=block_light,
+            sky_light=sky_light,
+            submerged_factor=submerged_factor,
+            quality_budget=quality_budget,
+            optimization_pressure=optimization_pressure,
+            input_features=block.input_features,
+        )
+
+        for _ in range(max(warmup, 0)):
+            _render_shader_block(block, shader_inputs, scene_hints)
+
+        timings: list[float] = []
+        for _ in range(max(iterations, 1)):
+            started_at = perf_counter()
+            _render_shader_block(block, shader_inputs, scene_hints)
+            timings.append((perf_counter() - started_at) * 1000.0)
+
+        average_ms = float(np.mean(timings))
+        updates_per_second = 1000.0 / average_ms if average_ms > 0.0 else float("inf")
+        results.append(
+            ShaderProfileBenchmarkResult(
+                device=resolved_device,
+                profile=block.profile,
+                backend=block.backend,
+                width=width,
+                height=height,
+                average_ms=average_ms,
+                min_ms=float(np.min(timings)),
+                max_ms=float(np.max(timings)),
+                p95_ms=float(np.percentile(np.asarray(timings, dtype=np.float64), 95.0)),
+                iterations=max(iterations, 1),
+                updates_per_second=updates_per_second,
+                pixels_per_second=updates_per_second * batch_size,
+            )
+        )
+
+    return results
+
+
+def _render_shader_block(
+    block: _ShaderFieldBlock,
+    shader_inputs: np.ndarray,
+    scene_hints: _ScenePolicyHints = _ScenePolicyHints(),
+) -> tuple[np.ndarray, float, float]:
+    output = _apply_realtime_budget_policy(block(shader_inputs), scene_hints, profile=block.profile)
+    return _pack_shader_pixels_array(output)
+
+
 def _array_from_payload(payload: dict[str, Any], key: str, *, ndim: int) -> np.ndarray:
     if key not in payload:
         raise KeyError(f"Missing required field: {key}")
@@ -1188,13 +1758,50 @@ def _ensure_rank2(array: np.ndarray, name: str) -> np.ndarray:
     return array
 
 
+def _clamp_unit(value: Any, default: float) -> float:
+    try:
+        return float(np.clip(float(value), 0.0, 1.0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _scene_policy_hints_from_payload(payload: dict[str, Any]) -> _ScenePolicyHints:
+    return _ScenePolicyHints(
+        sun_height=_clamp_unit(payload.get("sun_height", 0.5), 0.5),
+        rain_strength=_clamp_unit(payload.get("rain_strength", 0.0), 0.0),
+        thunder_strength=_clamp_unit(payload.get("thunder_strength", 0.0), 0.0),
+        block_light=_clamp_unit(payload.get("block_light", 0.0), 0.0),
+        sky_light=_clamp_unit(payload.get("sky_light", 1.0), 1.0),
+        submerged_factor=_clamp_unit(payload.get("submerged_factor", 0.0), 0.0),
+        quality_budget=_clamp_unit(payload.get("quality_budget", 1.0), 1.0),
+        optimization_pressure=_clamp_unit(payload.get("optimization_pressure", 0.0), 0.0),
+    )
+
+
+def _scene_policy_hints_payload(hints: _ScenePolicyHints) -> dict[str, float]:
+    return {
+        "sun_height": hints.sun_height,
+        "rain_strength": hints.rain_strength,
+        "thunder_strength": hints.thunder_strength,
+        "block_light": hints.block_light,
+        "sky_light": hints.sky_light,
+        "submerged_factor": hints.submerged_factor,
+        "quality_budget": hints.quality_budget,
+        "optimization_pressure": hints.optimization_pressure,
+    }
+
+
 _BINARY_MAGIC = b"NPXB"
 _BINARY_VERSION = 1
-_BINARY_KIND_SHADER_RUN_REQUEST = 1
+_BINARY_KIND_SHADER_RUN_REQUEST_V1 = 1
 _BINARY_KIND_SHADER_RUN_RESPONSE = 2
+_BINARY_KIND_SHADER_RUN_REQUEST_V2 = 3
+_BINARY_KIND_SHADER_RUN_REQUEST_V3 = 4
 _BINARY_KIND_ERROR = 255
 _BINARY_HEADER = struct.Struct("<4sBBHI")
-_BINARY_SHADER_RUN_REQUEST = struct.Struct("<16s6f")
+_BINARY_SHADER_RUN_REQUEST_V1 = struct.Struct("<16s6f")
+_BINARY_SHADER_RUN_REQUEST_V2 = struct.Struct("<16s12f")
+_BINARY_SHADER_RUN_REQUEST_V3 = struct.Struct("<16s14f")
 _BINARY_SHADER_RUN_RESPONSE = struct.Struct("<IIffHHI")
 _BINARY_ERROR = struct.Struct("<H")
 
@@ -1224,14 +1831,101 @@ def _encode_binary_error(message: str) -> bytes:
     return _encode_binary_frame(_BINARY_KIND_ERROR, _BINARY_ERROR.pack(len(encoded)) + encoded)
 
 
-def _decode_binary_shader_run_request(payload: bytes) -> dict[str, Any]:
-    if len(payload) != _BINARY_SHADER_RUN_REQUEST.size:
+def _decode_binary_shader_run_request_v1(payload: bytes) -> dict[str, Any]:
+    if len(payload) != _BINARY_SHADER_RUN_REQUEST_V1.size:
         raise ValueError(
-            f"Invalid shader_run binary payload size: expected {_BINARY_SHADER_RUN_REQUEST.size}, got {len(payload)}"
+            f"Invalid shader_run v1 binary payload size: expected {_BINARY_SHADER_RUN_REQUEST_V1.size}, got {len(payload)}"
         )
-    session_bytes, pos_x, pos_y, pos_z, yaw_degrees, pitch_degrees, time_seconds = _BINARY_SHADER_RUN_REQUEST.unpack(
+    session_bytes, pos_x, pos_y, pos_z, yaw_degrees, pitch_degrees, time_seconds = _BINARY_SHADER_RUN_REQUEST_V1.unpack(
         payload
     )
+    request = {
+        "session_id": session_bytes.hex(),
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+        "pos_z": pos_z,
+        "yaw_degrees": yaw_degrees,
+        "pitch_degrees": pitch_degrees,
+        "time_seconds": time_seconds,
+    }
+    request.update(_scene_policy_hints_payload(_ScenePolicyHints()))
+    return request
+
+
+def _decode_binary_shader_run_request_v2(payload: bytes) -> dict[str, Any]:
+    if len(payload) != _BINARY_SHADER_RUN_REQUEST_V2.size:
+        raise ValueError(
+            f"Invalid shader_run v2 binary payload size: expected {_BINARY_SHADER_RUN_REQUEST_V2.size}, got {len(payload)}"
+        )
+    unpacked = _BINARY_SHADER_RUN_REQUEST_V2.unpack(payload)
+    (
+        session_bytes,
+        pos_x,
+        pos_y,
+        pos_z,
+        yaw_degrees,
+        pitch_degrees,
+        time_seconds,
+        sun_height,
+        rain_strength,
+        thunder_strength,
+        block_light,
+        sky_light,
+        submerged_factor,
+    ) = unpacked
+    request = {
+        "session_id": session_bytes.hex(),
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+        "pos_z": pos_z,
+        "yaw_degrees": yaw_degrees,
+        "pitch_degrees": pitch_degrees,
+        "time_seconds": time_seconds,
+        "sun_height": sun_height,
+        "rain_strength": rain_strength,
+        "thunder_strength": thunder_strength,
+        "block_light": block_light,
+        "sky_light": sky_light,
+        "submerged_factor": submerged_factor,
+    }
+    request.update(
+        _scene_policy_hints_payload(
+            _ScenePolicyHints(
+                sun_height=sun_height,
+                rain_strength=rain_strength,
+                thunder_strength=thunder_strength,
+                block_light=block_light,
+                sky_light=sky_light,
+                submerged_factor=submerged_factor,
+            )
+        )
+    )
+    return request
+
+
+def _decode_binary_shader_run_request_v3(payload: bytes) -> dict[str, Any]:
+    if len(payload) != _BINARY_SHADER_RUN_REQUEST_V3.size:
+        raise ValueError(
+            f"Invalid shader_run v3 binary payload size: expected {_BINARY_SHADER_RUN_REQUEST_V3.size}, got {len(payload)}"
+        )
+    unpacked = _BINARY_SHADER_RUN_REQUEST_V3.unpack(payload)
+    (
+        session_bytes,
+        pos_x,
+        pos_y,
+        pos_z,
+        yaw_degrees,
+        pitch_degrees,
+        time_seconds,
+        sun_height,
+        rain_strength,
+        thunder_strength,
+        block_light,
+        sky_light,
+        submerged_factor,
+        quality_budget,
+        optimization_pressure,
+    ) = unpacked
     return {
         "session_id": session_bytes.hex(),
         "pos_x": pos_x,
@@ -1240,6 +1934,14 @@ def _decode_binary_shader_run_request(payload: bytes) -> dict[str, Any]:
         "yaw_degrees": yaw_degrees,
         "pitch_degrees": pitch_degrees,
         "time_seconds": time_seconds,
+        "sun_height": sun_height,
+        "rain_strength": rain_strength,
+        "thunder_strength": thunder_strength,
+        "block_light": block_light,
+        "sky_light": sky_light,
+        "submerged_factor": submerged_factor,
+        "quality_budget": quality_budget,
+        "optimization_pressure": optimization_pressure,
     }
 
 
@@ -1408,8 +2110,14 @@ class SocketBridgeRequestHandler(socketserver.StreamRequestHandler):
 
         payload = _read_exact(self.rfile, payload_size)
         try:
-            if kind == _BINARY_KIND_SHADER_RUN_REQUEST:
-                frame = self.server.state.render_shader_frame(_decode_binary_shader_run_request(payload))
+            if kind == _BINARY_KIND_SHADER_RUN_REQUEST_V1:
+                frame = self.server.state.render_shader_frame(_decode_binary_shader_run_request_v1(payload))
+                response = _encode_binary_shader_run_response(frame)
+            elif kind == _BINARY_KIND_SHADER_RUN_REQUEST_V2:
+                frame = self.server.state.render_shader_frame(_decode_binary_shader_run_request_v2(payload))
+                response = _encode_binary_shader_run_response(frame)
+            elif kind == _BINARY_KIND_SHADER_RUN_REQUEST_V3:
+                frame = self.server.state.render_shader_frame(_decode_binary_shader_run_request_v3(payload))
                 response = _encode_binary_shader_run_response(frame)
             else:
                 response = _encode_binary_error(f"Unsupported binary bridge kind: {kind}")

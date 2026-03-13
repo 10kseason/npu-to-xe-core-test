@@ -47,9 +47,9 @@ void main() {
         opacity = clamp(0.20 + albedo.a * 0.30, 0.16, 0.58);
         outColor = baseColor * waterTint;
 
-        vec2 waterFlow = normalize(policy.trajectory * 1.00 + worldNormal.xz * 0.28) * 0.5 + 0.5;
-        float reflectivity = clamp(0.14 + policy.energy * 0.30 + policy.budget * 0.16 + bakedLight.y * 0.04, 0.10, 0.62);
-        float roughness = clamp(0.76 - policy.budget * 0.26 + (1.0 - policy.energy) * 0.08 + (1.0 - abs(worldNormal.y)) * 0.12, 0.32, 0.88);
+        vec2 waterFlow = normalize(policy.trajectory * 1.16 + worldNormal.xz * 0.18) * 0.5 + 0.5;
+        float reflectivity = clamp(0.20 + policy.energy * 0.38 + policy.budget * 0.22 + bakedLight.y * 0.05, 0.14, 0.78);
+        float roughness = clamp(0.70 - policy.budget * 0.34 + (1.0 - policy.energy) * 0.05 + (1.0 - abs(worldNormal.y)) * 0.08, 0.18, 0.78);
         auxWater = vec4(waterFlow, reflectivity, roughness);
     }
 

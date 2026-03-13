@@ -21,8 +21,9 @@ void main() {
     vec2 bakedLight = texture2D(lightmap, lightmapCoord).rg;
     vec3 encodedNormal = normalize(worldNormal) * 0.5 + 0.5;
 
-    /* RENDERTARGETS: 0,1,2 */
+    /* RENDERTARGETS: 0,1,2,4 */
     gl_FragData[0] = vec4(toLinear(albedo.rgb), 1.0);
     gl_FragData[1] = vec4(encodedNormal, 1.0);
     gl_FragData[2] = vec4(clamp(bakedLight, 0.0, 1.0), 0.0, 1.0);
+    gl_FragData[3] = vec4(0.5, 0.5, 0.0, 1.0);
 }

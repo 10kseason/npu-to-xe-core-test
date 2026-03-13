@@ -6,7 +6,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .bridge import serve
+from .bridge import benchmark_shader_profile, serve
 from .engine import BenchmarkResult, OpenVINOTensorCore
 
 
@@ -25,6 +25,20 @@ def _print_benchmarks(results: Sequence[BenchmarkResult]) -> None:
             f"{result.max_ms:6.3f}  "
             f"{result.iterations:10d}  "
             f"{result.output_shape}"
+        )
+
+
+def _print_shader_profile_benchmarks(results: Sequence[object]) -> None:
+    print("device  profile            backend                        avg_ms  p95_ms  ups     pixels/s")
+    for result in results:
+        print(
+            f"{result.device:6}  "
+            f"{result.profile:16}  "
+            f"{result.backend:28}  "
+            f"{result.average_ms:6.3f}  "
+            f"{result.p95_ms:6.3f}  "
+            f"{result.updates_per_second:6.2f}  "
+            f"{result.pixels_per_second:9.0f}"
         )
 
 
@@ -64,6 +78,20 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument("--hint", choices=["LATENCY", "THROUGHPUT"], default="THROUGHPUT")
     linear.add_argument("--no-turbo", action="store_true")
     linear.add_argument("--json", action="store_true")
+
+    shader_profile = subparsers.add_parser(
+        "shader-profile",
+        help="Benchmark the current shader assist profile as an NPU/GPU/CPU workload.",
+    )
+    shader_profile.add_argument("--profile", default="intel_npu_gi_v3")
+    shader_profile.add_argument("--width", type=int, default=80)
+    shader_profile.add_argument("--height", type=int, default=80)
+    shader_profile.add_argument("--devices", default="NPU,GPU,CPU")
+    shader_profile.add_argument("--iters", type=int, default=20)
+    shader_profile.add_argument("--warmup", type=int, default=3)
+    shader_profile.add_argument("--hint", choices=["LATENCY", "THROUGHPUT"], default="THROUGHPUT")
+    shader_profile.add_argument("--no-turbo", action="store_true")
+    shader_profile.add_argument("--json", action="store_true")
 
     bridge = subparsers.add_parser(
         "serve",
@@ -140,6 +168,23 @@ def main() -> None:
             print(json.dumps([result.to_dict() for result in results], indent=2))
             return
         _print_benchmarks(results)
+        return
+
+    if args.command == "shader-profile":
+        results = benchmark_shader_profile(
+            profile=args.profile,
+            width=args.width,
+            height=args.height,
+            devices=tuple(_parse_devices(args.devices)),
+            warmup=args.warmup,
+            iterations=args.iters,
+            performance_hint=args.hint,
+            turbo=not args.no_turbo,
+        )
+        if args.json:
+            print(json.dumps([result.to_dict() for result in results], indent=2))
+            return
+        _print_shader_profile_benchmarks(results)
         return
 
     if args.command == "serve":
